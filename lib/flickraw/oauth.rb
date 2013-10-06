@@ -1,5 +1,6 @@
 require 'openssl'
 require 'net/https'
+require 'net/http/post/multipart'
 
 module FlickRaw
   class OAuthClient
@@ -93,30 +94,33 @@ module FlickRaw
     end
     
     def post_multipart(url, token_secret, oauth_params = {}, params = {})
-      post(url, token_secret, oauth_params, params) {|request|
-        boundary = "FlickRaw#{OAuthClient.gen_nonce}"
-        request['Content-type'] = "multipart/form-data, boundary=#{boundary}"
+      url = URI.parse(url)
+      default_oauth_params = OAuthClient.gen_default_params
+      default_oauth_params[:oauth_consumer_key] = @consumer_key
+      default_oauth_params[:oauth_signature_method] = "PLAINTEXT" if url.scheme == 'https'
+      oauth_params = default_oauth_params.merge(oauth_params)
+      params_signed = params.reject {|k,v| v.respond_to? :read}.merge(oauth_params)
+      oauth_params[:oauth_signature] = sign(:post, url, params_signed, token_secret)
 
-        request.body = ''
-        params.each { |k, v|
-          if v.respond_to? :read
-            basename = File.basename(v.path.to_s) if v.respond_to? :path
-            basename ||= File.basename(v.base_uri.to_s) if v.respond_to? :base_uri
-            basename ||= "unknown"
-            request.body << "--#{boundary}\r\n" <<
-              "Content-Disposition: form-data; name=\"#{OAuthClient.encode_value(k)}\"; filename=\"#{OAuthClient.encode_value(basename)}\"\r\n" <<
-              "Content-Transfer-Encoding: binary\r\n" <<
-              "Content-Type: image/jpeg\r\n\r\n" <<
-              v.read << "\r\n"
-          else
-            request.body << "--#{boundary}\r\n" <<
-              "Content-Disposition: form-data; name=\"#{OAuthClient.encode_value(k)}\"\r\n\r\n" <<
-              "#{OAuthClient.encode_value(v)}\r\n"
-          end
-        }
+      http = Net::HTTP.new(url.host, url.port, @proxy.host, @proxy.port, @proxy.user, @proxy.password)
+      http.use_ssl = (url.scheme == 'https')
+      r = http.start {|agent|
+
+        v = params['photo']
+        basename = File.basename(v.path.to_s) if v.respond_to? :path
+        basename ||= File.basename(v.base_uri.to_s) if v.respond_to? :base_uri
+        basename ||= "unknown"
+        params['photo'] = UploadIO.new(v, "image/jpeg", OAuthClient.encode_value(basename))
         
-        request.body << "--#{boundary}--"
+        request = Net::HTTP::Post::Multipart.new(url.path,params)
+        request['User-Agent'] = @user_agent if @user_agent
+        request['Authorization'] = OAuthClient.authorization_header(url, oauth_params)
+
+        agent.request(request)
       }
+      
+      raise FailedResponse.new(r.body) if r.is_a? Net::HTTPClientError
+      r
     end
 
     private
